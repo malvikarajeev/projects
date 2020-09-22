@@ -1,0 +1,729 @@
+---
+title: "Voxel Data Analysis"
+author: "Malvika Rajeev"
+date: "12/10/2019"
+urlcolor: blue
+header-includes:
+   - \usepackage{float}
+   - \usepackage{amsmath}
+   - \usepackage{amssymb}
+output: 
+  pdf_document:
+    number_sections: true
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      echo = FALSE,
+                      cache = TRUE,
+                      fig.align = 'center')
+
+library(ggplot2)
+library(reshape2)
+library("devtools")
+library("tibble")
+library(gganimate)
+library("ggplot2")
+library("modelr")
+library(knitr)
+library(data.table)
+library("dplyr")
+library("purrr")
+library("tidyr")
+library("pryr")
+library(coefplot)
+library(caret)
+library(processx)
+library(ranger)
+library(e1071)
+library(animation)
+library(tidyverse)
+library(gridExtra)
+library(foreach)
+library(doParallel)
+library(glmnet)
+library(tidyverse)
+library(doSNOW)
+library(pheatmap)
+library(irlba)
+library(RColorBrewer)
+library(plotly)
+
+
+#setwd('~/Desktop/stat215/stat-215-a/lab_final')
+
+fmri = load("data/fMRIdata.RData")
+
+```
+
+#Introduction
+
+Understanding how our brain reacts to images is definitely important for AI advancements but also for detecting anamolies in brains and hence advance the field of neurological prognosis. In this analysis we work with the reaction of $20$ voxels in the human brain to 1750 different images. <br> <br>
+
+Every image is a vector in $R^{10921}$. There are 1750 images provided to us with responses in terms of the signal in the voxels of the brain, and 120 images without responses (test). There is also a data set containing the 3-Dimensional spatial location of the data. 
+
+
+#How are the voxels located?
+```{r voxel_location}
+
+
+loc_dat = data.frame(loc_dat)
+
+
+
+##pick k random images
+
+kk = 20
+
+image = data.frame(t(sample_n(data.frame(resp_dat), kk)))
+colnames(image) = 1:kk
+image$X1 = loc_dat$X1
+image$X2 = loc_dat$X2
+image$X3 = loc_dat$X3
+
+image = melt(image, c('X1','X2','X3'), variable.name = 'Image', value.name = 'Intensity')
+
+
+
+p = plot_ly(image, x = ~X3, y = ~X2, z = ~X1, color = ~Intensity) %>%   add_markers() %>%
+  add_markers(frame = ~Image) %>%
+  layout(title = 'Intensity of voxels',
+         scene = list(xaxis = list(title = 'Dimension 1'),
+                     yaxis = list(title = 'Dimension 2'),
+                     zaxis = list(title = 'Dimension 3'))) 
+pa = animation_opts(p)
+
+
+htmlwidgets::saveWidget(as_widget(pa), "images_voxels.html")
+
+
+```
+
+Check out this gif that shows the way the voxels light up for 20 random images (make sure you knit the .Rmd before clicking on the link) :
+[Intensity of Voxels](images_voxels.html)
+
+#Dividing Data
+
+This is a large dataset: I decided to use training dataset in a split of 70-20-10. Because we don't have responses for the test datatset, I decided to create a mini dataset within my training datset that I would use for final diagnostics. I use the validations Set for tuning the parameters.
+
+```{r dividing_data}
+
+##separate into validation and training and test
+n = nrow(fit_feat)
+dat = data.frame(fit_feat, resp_dat)
+assignment = sample(1:3, size = nrow(dat), prob = c(0.7,0.2,0.1), replace = TRUE)
+train = as.matrix(dat[assignment == 1,])
+train = scale(train, center = T, scale = F)
+
+valid = dat[assignment == 2,] %>% as.matrix
+valid = scale(valid, center = T, scale = F)
+
+test = dat[assignment == 3,] %>% as.matrix
+test = scale(test, center = T, scale = F)
+
+division = data.frame(set = c('Training', 'Validation', 'Test'), N= c(nrow(train), nrow(valid),nrow(test)))
+
+##pie chart of data division
+bp =  ggplot(division, aes(x ="", y = N, fill = set))+
+geom_bar(width = 1, stat = "identity") 
+bp = bp+ coord_polar("y", start=0) + theme_classic() + geom_text(aes(label = paste(N, 'obs', sep = " ")), position = position_stack(vjust = 0.5)) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme(axis.line = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          plot.title = element_text(hjust = 0.5, color = "#666666"))
+
+ggsave(plot = bp, filename = "figures/data_division.png",
+      device = "png", width = 6.5, height = 3)
+
+```
+
+```{r load-figure1, echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "Division of Data."}
+knitr::include_graphics("figures/data_division.png", dpi = 350)
+```
+
+
+#Choice of Regression Methods
+
+The two regression methods used are LASSO and Ridge Regression. At this point, I hypothesize that LASSO method will work better for this dataset because:
+<br> <br>
+1. The number of variables (dimensions of an image) is much larger than number of observations (number of images).
+<br>
+2. The variables are highly correlated.
+<br>
+
+
+##Validation
+
+So, with our training and validation data, we calculate the different metrics:
+
+1. **AIC, BIC**: AIC estimates the relative amount of information lost by a given model: the less information a model loses, the higher the quality of that model. It creates a trade-off between how well the model fits (value of log-likelihood) and the 'complexity' - the number of predictors used. BIC imposes a higher penalty on complexity as no. of observations increase, but is useful only when the number of observations is higher than the number of variables, which is not the case here.
+
+2. **AICc**: AICc is AIC with a correction for hen number of observations is small compared to number of variables/predictors. 
+
+Also note that AICc, AIC, and BIC  are derived from asymptotic results, so even when model assumptions are satisfied, they may not work well in the finite sample
+case.
+
+3. **Correlation Metric** is the correlation between the fitted and observed values in validation set. The higher the better. It helps in giving an understanding of the association between fitted and observed. However, its possible that correlation is high but predictions are off. 
+
+4. **MSE of validation set** in the traditional sense, a reliable metric. 
+
+5. **Estimation Stability metric of validation set**: Useful for us to understand the stability of our parameter: However,it doesn't take into account the true values. 
+
+
+- For lasso and ridge. On the basis of this, we chose the best model. We then test this model on the test set later.
+
+
+```{r regression, echo = F, message = F, warning = F}
+
+
+#setwd('~/Desktop/stat215/stat-215-a/lab_final')
+
+
+##function to get aic, bic, aicc
+get_AIC_AICc_BIC = function(glm_fit){
+  tLL = glm_fit$nulldev - deviance(glm_fit)
+  k = glm_fit$df
+  n = glm_fit$nobs
+  AIC = -tLL + 2*k
+  AICc = -tLL + 2*k + ((2*k*(k+1))/(n-k-1))
+  BIC = log(n)*k - tLL
+  return(c(AIC, AICc, BIC))
+}
+
+
+
+
+# 
+# 
+# 
+
+
+##creating two separate databases for lasso and ridge
+
+##define range of lambdas 
+lambdas = 5^seq(-4, -0.5, length.out = 20)
+
+
+# #######FUNCTION TO get all the metrics for lasso regression
+for_each_lasso = function(voxel, i) {
+  in_sample_error = numeric(0)
+  cv.mse = numeric(0)
+  aic = numeric(0)
+  aicc = numeric(0)
+  bic = numeric(0)
+  es.cv = numeric(0)
+  valid_cor = numeric(0)
+
+  feat = as.matrix(train[, 1:ncol(fit_feat)])
+  resp = train[, ncol(fit_feat) + voxel]
+  #cat('lambda',lambda,'voxel',voxel)
+
+  fit = glmnet(x = as.matrix(feat), y = resp, family = 'gaussian', alpha =        1, lambda = lambdas[i])
+
+  in_sample_error = mean((predict(fit, feat) - resp)^2) %>% as.numeric
+
+
+  validation = predict(fit, as.matrix(valid[, 1:ncol(fit_feat)]))
+  cv.mse = mean((validation - valid[,ncol(fit_feat) + voxel])^2, na.rm = T) %>%  as.numeric
+  valid_cor = cor(validation, as.matrix(valid[,ncol(fit_feat) + voxel]), use = 'complete.obs')
+
+  temp = get_AIC_AICc_BIC(fit)
+  aic = temp[1] %>% as.numeric()
+  aicc = temp[2] %>% as.numeric()
+  bic = temp[3] %>% as.numeric()
+
+  ##stabiliity metric
+  es.cv = var(validation, na.rm = T)/ sum(validation^2, na.rm =T)
+
+  return(data.frame(voxel = voxel,
+                    lambda = lambdas[i],
+                    in_sample_error = in_sample_error,
+                    cv.mse = cv.mse,
+                    valid_cor = valid_cor,
+                    aic = aic,
+                    aicc = aicc,
+                    bic = bic,
+                    es.cv = es.cv))
+}
+
+# ##########parallelising computation########
+# 
+# ##############
+nCores = detectCores()
+cl <- makeCluster(nCores[1] - 1)
+registerDoParallel(cl)
+
+
+
+lasso = foreach(voxel = 1:20, .combine='rbind', .packages = c('glmnet', 'foreach','dplyr')) %dopar% {
+
+                foreach(i = 1:length(lambdas)) %do% {
+                      for_each_lasso(voxel, i)
+                }
+}
+
+stopCluster(cl)
+# 
+lasso_voxel = bind_rows(lasso, .id = NULL)
+# ###############
+# 
+# #######FUNCTION TO get all the metrics for ridge regression
+
+lambdas = 2^seq(0.5, 12, length.out = 20) 
+for_each_ridge = function(voxel, i) {
+  in_sample_error = numeric(0)
+  cv.mse = numeric(0)
+  aic = numeric(0)
+  aicc = numeric(0)
+  bic = numeric(0)
+  es.cv = numeric(0)
+  valid_cor = numeric(0)
+
+  feat = as.matrix(train[, 1:ncol(fit_feat)])
+  resp = train[, ncol(fit_feat) + voxel]
+  #cat('lambda',lambda,'voxel',voxel)
+
+  fit = glmnet(x = as.matrix(feat), y = resp, family = 'gaussian', alpha =        0, lambda = lambdas[i])
+
+  in_sample_error = mean((predict(fit, feat) - resp)^2) %>% as.numeric
+
+
+  validation = predict(fit, as.matrix(valid[, 1:ncol(fit_feat)]))
+  cv.mse = mean((validation - valid[,ncol(fit_feat) + voxel])^2, na.rm = T) %>%  as.numeric
+  valid_cor = cor(validation, as.matrix(valid[,ncol(fit_feat) + voxel]), use = 'complete.obs')
+
+  temp = get_AIC_AICc_BIC(fit)
+  aic = temp[1] %>% as.numeric()
+  aicc = temp[2] %>% as.numeric()
+  bic = temp[3] %>% as.numeric()
+
+  ##stabiliity metric
+  es.cv = var(validation, na.rm = T)/ sum(validation^2, na.rm =T)
+
+  return(data.frame(voxel = voxel,
+                    lambda = lambdas[i],
+                    in_sample_error = in_sample_error,
+                    cv.mse = cv.mse,
+                    valid_cor = valid_cor,
+                    aic = aic,
+                    aicc = aicc,
+                    bic = bic,
+                    es.cv = es.cv))
+}
+# ####paralllesing computaiton#########
+# 
+nCores = detectCores()
+cl <- makeCluster(nCores[1] - 1)
+registerDoParallel(cl)
+
+
+ridge = foreach(voxel = 1:20, .combine='rbind', .packages = c('glmnet', 'foreach','dplyr')) %dopar% {
+
+  foreach(i = 1:length(lambdas)) %do% {
+    for_each_ridge(voxel, i)
+  }
+}
+stopCluster(cl)
+ridge_voxel = bind_rows(ridge, .id = NULL)
+
+
+    
+```
+
+
+<br> <br>
+So I draw the following comparisons:
+<br> <br>
+1. MSE CV VS CORRELATION CRITERIA <br>
+2.  MSE CV vs ES CV
+<br>
+for both **LASSO** and **ridge** regression.
+
+#Visualising Metrics
+
+```{r cv_corr, echo = F, message = F, warning = F}
+cv_corr = ggplot(lasso_voxel, aes(x = lambda)) +
+  geom_line(aes(y = valid_cor, col = 'blue'),lty = 2) + 
+  geom_point(aes(y = valid_cor), col = 'blue', size = 0.1,alpha = 0.3) + 
+  geom_line(aes(y = cv.mse, col = 'red'),lty = 2) + 
+  geom_point(aes(y = cv.mse), col = 'red', alpha = 0.3, size = 0.1) +
+  theme_minimal() + 
+  
+  scale_color_identity(breaks = c('blue', 'red'), 
+                       labels = c('Correlation', 'CV'),
+                       guide = 'legend') +
+  facet_wrap(~voxel) + 
+  labs(x = expression(lambda), y = 'Metric')
+
+ggsave(plot = cv_corr, filename = "figures/cs_corr.png",
+      device = "png", width = 8, height = 5)
+
+
+cv_corr_ridge = ggplot(ridge_voxel, aes(x = lambda)) +
+  geom_line(aes(y = valid_cor, col = 'blue'),lty = 2) + 
+  geom_point(aes(y = valid_cor), col = 'blue', size = 0.1,alpha = 0.3) + 
+  geom_line(aes(y = cv.mse, col = 'red'),lty = 2) + 
+  geom_point(aes(y = cv.mse), col = 'red', alpha = 0.3, size = 0.1) +
+  theme_minimal() + 
+  
+  scale_color_identity(breaks = c('blue', 'red'), 
+                       labels = c('Correlation', 'CV'),
+                       guide = 'legend') +
+  facet_wrap(~voxel) + 
+  labs(x = expression(lambda), y = 'Metric')
+
+ggsave(plot = cv_corr, filename = "figures/cs_corr_ridge.png",
+      device = "png", width = 8, height = 5)
+
+```
+
+```{r load-figure2, echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "Comparing correlation and CV of LASSO for each voxel."}
+knitr::include_graphics("figures/cs_corr.png", dpi = 350)
+```
+
+```{r load-figure3, echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "Comparing correlation and CV of RIDGE for each voxel."}
+knitr::include_graphics("figures/cs_corr_ridge.png", dpi = 350)
+```
+
+
+We want low MSE (denoted by CV) and high correlation. The minimum and maximum of the former and the latter seem to intersect.
+<br>
+For LASSO, the correlation metric is concave for most voxels, and has a clear peak. 
+For RIDGE, the correlation metric is seems to stabilize after reaching a value over 1000. 
+
+Also, for both cases, **voxel $20$ seems to have the worst fit**. 
+
+
+```{r cv_escv, echo = F, message = F, warning = F}
+cv_escv = ggplot(lasso_voxel, aes(x = lambda)) +
+  geom_line(aes(y = s0, col = 'blue'),lty = 2) + 
+  geom_point(aes(y = s0), col = 'blue', size = 0.1,alpha = 0.3) + 
+  geom_line(aes(y = cv.mse, col = 'red'),lty = 2) + 
+  geom_point(aes(y = cv.mse), col = 'red', alpha = 0.3, size = 0.1) +
+  theme_minimal() + 
+  
+  scale_color_identity(breaks = c('blue', 'red'), 
+                       labels = c('ES CV', 'CV'),
+                       guide = 'legend') +
+  facet_wrap(~voxel) + 
+  labs(x = expression(lambda), y = 'Metric')
+
+ggsave(plot = cv_escv, filename = "figures/cs_escv.png",
+      device = "png", width = 8, height = 5)
+
+
+cv_escv_ridge = ggplot(ridge_voxel, aes(x = lambda)) +
+  geom_line(aes(y = s0, col = 'blue'),lty = 2) + 
+  geom_point(aes(y = s0), col = 'blue', alpha = 0.3, size = 0.1) + 
+  geom_line(aes(y = cv.mse, col = 'red'),lty = 2) + 
+  geom_point(aes(y = cv.mse), col = 'red', alpha = 0.3, size = 0.1) +
+  theme_minimal() + 
+  scale_color_identity(breaks = c('blue', 'red'), 
+                       labels = c('ES CV', 'CV'),
+                       guide = 'legend') +
+  facet_wrap(~voxel) + 
+  labs(x = expression(lambda), y = 'Metric')
+
+ggsave(plot = cv_escv_ridge, filename = "figures/cs_escv_ridge.png",
+      device = "png", width = 8, height = 5)
+
+```
+
+```{r load-figure4, echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "Comparing ES-CV and CV of LASSO for each voxel."}
+knitr::include_graphics("figures/cs_escv.png", dpi = 350)
+```
+
+```{r load-figure5, echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "Comparing ES-CV and CV of RIDGE for each voxel."}
+knitr::include_graphics("figures/cs_escv_ridge.png", dpi = 350)
+```
+
+
+
+
+#Performance Indicators and Diagnostics
+
+According to the metrics of *MSE or Correlation*, I find the corresponding optimal $\lambda$ for each voxel, for *LASSO* and *RIDGE* regression. In the following sections I will limit my analysis to voxel = 7. 
+
+```{r opt_lambdas, echo = F, message = F, warning = F}
+
+lasso_voxel = data.table(lasso_voxel)
+
+ridge_voxel = data.table(ridge_voxel)
+
+
+
+
+opt.lambdas.lasso = lasso_voxel[, .SD[which.min(cv.mse)], by = voxel] %>% pull(lambda)
+mse.lasso = lasso_voxel[, .SD[which.min(cv.mse)], by = voxel] %>% pull(cv.mse)
+
+opt.lambdas.ridge = ridge_voxel[, .SD[which.min(cv.mse)], by = voxel] %>% pull(lambda)
+mse.ridge = ridge_voxel[, .SD[which.min(cv.mse)], by = voxel] %>% pull(cv.mse)
+
+
+
+
+
+
+final.opt = data.frame(1:20,opt.lambdas.lasso, mse.lasso, opt.lambdas.ridge, mse.ridge)
+names(final.opt) = c('Voxel','Optimal Lasso Lambda', 'MSE','Optimal Ridge Lambda', 'MSE')
+
+
+kable(final.opt, digits= 3, align = 'c', caption = 'Optimal Lambdas for different voxels') 
+
+```
+
+We see that all voxels, the optimal $\lambda$ are less than 0.1. <br> <br>
+
+Again, I use voxel 7 for diagnostics. 
+
+```{r opt_plot, echo = F, message = F, warning = F}
+
+##picking voxel 2 FOR DIAGNOSTICS
+#set.seed(4)
+voxel = 7
+
+opt.lambda = opt.lambdas.lasso[voxel]
+
+test.truth = test[,ncol(fit_feat) + voxel]
+
+
+feat = as.matrix(train[, 1:ncol(fit_feat)])
+resp = as.matrix(train[,ncol(fit_feat) + voxel])
+  
+
+fit = glmnet(x = as.matrix(feat), y = resp, family = 'gaussian', alpha = 1,                         lambda = opt.lambda)
+preds = predict(fit, as.matrix(test[, 1:ncol(fit_feat)]))
+
+  
+test.long = data.frame(Predictions = preds, Truth = test.truth)
+names(test.long)[1] = 'Predictions'
+
+test.plot.lasso = ggplot(test.long, aes(x = Predictions, y = Truth)) +
+  geom_point(size = 0.1) + theme_minimal() + geom_abline(slope = 1, intercept = 1, col = 'blue', lty = 2) 
+
+ggsave(plot = test.plot.lasso, filename = 'figures/test.plot.lasso.png', height = 4, width = 6.4)
+
+```
+
+```{r load-figure6,echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "Voxel 7 on Test Dataset with optimal lambda according to LASSO"}
+knitr::include_graphics("figures/test.plot.lasso.png", dpi = 350)
+
+```
+
+
+```{r opt_plot_ridge, echo = F, message = F, warning = F}
+
+voxel = 7
+
+opt.lambda = opt.lambdas.ridge[voxel]
+
+test.truth = test[,ncol(fit_feat) + voxel]
+
+
+feat = as.matrix(train[, 1:ncol(fit_feat)])
+resp = as.matrix(train[,ncol(fit_feat) + voxel])
+  
+
+fit = glmnet(x = as.matrix(feat), y = resp, family = 'gaussian', alpha = 0,                         lambda = opt.lambda)
+preds = predict(fit, as.matrix(test[, 1:ncol(fit_feat)]))
+
+  
+test.long = data.frame(Predictions = preds, Truth = test.truth)
+names(test.long)[1] = 'Predictions'
+
+test.plot.ridge = ggplot(test.long, aes(x = Predictions, y = Truth)) +
+  geom_point(size = 0.1) + theme_minimal() + geom_abline(slope = 1, intercept = 1, col = 'blue', lty = 2) 
+
+
+ggsave(plot = test.plot.ridge, filename = 'figures/test.plot.ridge.png', height = 4, width = 6.4)
+
+
+
+```
+
+```{r load-figure7,echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "Voxel 7 on Test Dataset with optimal lambda according to RIDGE"}
+knitr::include_graphics("figures/test.plot.ridge.png", dpi = 350)
+
+```
+
+
+**A Few Observations:** <br> <br>
+Firstly, In case of LASSO and Ridge the model is underestimating. <br>
+Secondly, the performance of both LASSO and ridge seem similar. 
+ <br> <br> <br>
+
+
+
+#Stability Analysis 
+
+I re-sample 100 times, get a new fit with the optimal $\lambda$ (for both LASSO and Ridge), calculate MSE, and also report the number of non-zero coefficients each time. 
+
+```{r stability, echo = F, message = F, warning = F}
+####
+train_valid = data.frame(rbind(train, valid))
+
+
+non_zero = function(fit){
+tmp_coeffs <- coef(fit)
+data.frame(name = tmp_coeffs@Dimnames[[1]][tmp_coeffs@i + 1], coefficient = tmp_coeffs@x)
+}
+
+####
+
+stability_eval = function(voxel) {
+opt.lasso = opt.lambdas.lasso[voxel]
+
+opt.ridge = opt.lambdas.ridge[voxel]
+
+mse_lasso = numeric(100)
+mse_ridge = numeric(100)
+
+coeffs_lasso = list()
+coeffs_ridge = list()
+
+for (i in 1:100) {
+  train_on = as.matrix(sample_frac(train_valid,0.77 , replace = T))
+  fit1 = glmnet(train_on[,1:ncol(fit_feat)], train_on[, ncol(fit_feat) + voxel], family = 'gaussian', alpha = 1, lambda = opt.lasso)
+  preds = predict(fit1, as.matrix(test[,1:ncol(fit_feat)]))
+  truth = test[,ncol(fit_feat) + voxel]
+  mse_lasso[i] = mean((preds - truth)^2)
+  coeffs_lasso[[i]] = non_zero(fit1)
+  
+  fit2 = glmnet(train_on[,1:ncol(fit_feat)], train_on[, ncol(fit_feat) + voxel], family = 'gaussian', alpha = 0, lambda = opt.ridge)
+  preds = predict(fit2, as.matrix(test[,1:ncol(fit_feat)]))
+  truth = test[,ncol(fit_feat) + voxel]
+  mse_ridge[i] = mean((preds - truth)^2)
+  coeffs_ridge[[i]] = non_zero(fit2)
+  
+}
+return(list(mse_lasso = mse_lasso, mes_ridge = mse_ridge, coeffs_ridge = coeffs_ridge, coeffs_lasso= coeffs_lasso))
+}
+
+voxel7 = stability_eval(7)
+
+library(viridisLite)
+mses = data.table(lasso = voxel7$mse_lasso,ridge = voxel7$mes_ridge)
+mses = melt(mses)
+mses_hist = ggplot(mses, aes(x = value, fill = variable)) + geom_histogram(alpha = 0.7) +scale_fill_brewer('Dark2') + theme_minimal() + labs(x = 'MSE', y = ' ', fill = '') + theme(legend.title = element_blank())
+
+ggsave(plot = mses_hist, filename = "figures/mses_hist.png",
+      device = "png", width = 6.5, height = 3)
+
+##important coefficients
+coeffLasso = bind_rows(voxel7$coeffs_lasso, .id = 'iter')
+imp_lasso = coeffLasso %>% select(-iter, -coefficient) %>% table %>% sort(decreasing = T) %>% head(20)
+imp_lasso = imp_lasso[-1]
+imp_lasso = as.data.frame(imp_lasso)
+names(imp_lasso) = c('Feature', 'Frequency')
+imp_plot = ggplot(imp_lasso, aes(x = Feature, y = Frequency)) + geom_point(col = 'dark green') + theme_classic() + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+ggsave(plot = imp_plot, filename = "figures/imp_plot.png",
+      device = "png", width = 6.5, height = 3)
+
+```
+
+```{r load-figure8,echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "MSE's of test set with bootstrap training samples"}
+knitr::include_graphics("figures/mses_hist.png", dpi = 350)
+
+```
+
+```{r load-figure9,echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.pos = "H", fig.cap = "Most commonly occuring non-zero features in 100 fits of LASSO"}
+knitr::include_graphics("figures/imp_plot.png", dpi = 350)
+
+```
+
+The above graphs shows the features that are most stable across bootstrap samples for *voxel 7*. Feature X5721 is most important for this voxel 7. If we investigate the pixels corresponding to these features and the section of brain corresponding to voxel 7, we might find some discrenible relationship.  
+
+
+#Comparing Models for Voxels
+
+Every voxel has its own model and its own optimal lambda. I computed the number of non-zero coefficients for each voxels, and represented the ones that occur most frequently across each voxel. 
+
+```{r comparing_models, echo = F, message = F, warning = F}
+coeffs_lasso_voxel = list()
+coeffs_ridge_voxel = list()
+for (i in 1:20) {
+  fit1 = glmnet(train[,1:ncol(fit_feat)], train[, ncol(fit_feat) + i], family = 'gaussian', alpha = 1, lambda = opt.lambdas.lasso[i])
+  preds = predict(fit1, as.matrix(test[,1:ncol(fit_feat)]))
+  truth = test[,ncol(fit_feat) + i]
+  coeffs_lasso_voxel[[i]] = non_zero(fit1)
+  
+  fit2 = glmnet(train[,1:ncol(fit_feat)], train[, ncol(fit_feat) + i], family = 'gaussian', alpha = 0, lambda = opt.lambdas.ridge[i])
+  preds = predict(fit2, as.matrix(test[,1:ncol(fit_feat)]))
+  truth = test[,ncol(fit_feat) + i]
+  coeffs_ridge_voxel[[i]] = non_zero(fit2)
+}
+
+all_voxels = bind_rows(coeffs_lasso_voxel, .id = 'voxel')
+all_coeffs = all_voxels %>% select(-voxel, - coefficient) %>% pull(name) %>% table %>% sort(decreasing = T) %>% head(20) %>% data.frame
+all_coeffs = all_coeffs[-1,]
+colnames(all_coeffs) = c('Feature', 'Number of Voxels')
+
+all_voxels = data.table(all_voxels)
+most_imp = all_voxels[,.SD[which.max(coefficient)], by = voxel]
+names(most_imp) = c('Voxel', 'Feature', 'Coefficient')
+
+
+kable(all_coeffs, caption = 'Non-zero features across voxels', align = 'c')
+```
+
+```{r imp_table}
+
+kable(most_imp, caption = 'Most important feature for every Voxel', digits = 4)
+```
+
+
+Next, I compare the performance for voxel 7, for both LASSO and RIDGE.
+
+```{r lasso_v_ridge_voxel7, echo = F, message = F, warning = F}
+
+voxel = 7
+l = lasso_voxel %>% filter(voxel == 7, lambda == opt.lambdas.lasso[7])
+r = ridge_voxel %>% filter(voxel == 7, lambda == opt.lambdas.ridge[7])
+
+vox7 = rbind(l,r)
+vox7$method = c('LASSO', 'Ridge')
+colnames(vox7) = c('voxel', 'Lambda', 'blah', 'MSE', 'Corelation Metric',             'AIC','AICc','BIC','es cv', 'Method')
+vox7 = vox7[,-3]
+
+kable(vox7, digits = 3, caption = 'Performance of Optimal Lambdas for LASSO and RIDGE - Voxel 7', align = 'c')
+
+
+```
+
+*Hypothesis Testing* for parameters can be done by getting the SD of the parameters through bootstrapping, and then conducting a t-test.
+
+
+
+```{r output, echo = F, message = F, warning = F}
+opt.lambda = opt.lambdas.lasso[1]
+
+my_fit = glmnet(x = train[,1:ncol(fit_feat)], y = train[, ncol(fit_feat) + 1], lambda = opt.lambda, alpha = 1)
+
+val_feat = scale(as.matrix(val_feat, center = T, scale = F))
+my_predictions = predict(my_fit, val_feat)
+
+write.table(my_predictions, "output/predv1_malvikarajeev.txt", col.names = FALSE, row.names = FALSE)
+
+```
+
+
+#Conclusion 
+
+We found optimal $\lambda$s for LASSO and Ridge by comparing the MSE and the correlation coefficient which are monotonically decreasing. 
+
+The responses in terms of voxels are very normal shaped, so it's a good idea to form linear regression. LASSO seems like a better idea because $p>>n$ and because of the correlation between the features. <br>
+We can also explore some machine learning techniques like Random Forest or Neural Networks. <br>
+
+If this model fits the responses well, we can extend the analysis to include even more granular areas of brain. 
+
+
+
+
+
+
